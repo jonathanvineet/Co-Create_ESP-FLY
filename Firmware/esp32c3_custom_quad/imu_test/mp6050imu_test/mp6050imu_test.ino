@@ -2,24 +2,99 @@
 
 #define SDA_PIN 1
 #define SCL_PIN 0
-#define IMU_ADDR 0x68
+
+// Found by scanning at startup instead of being hardcoded. AD0 low = 0x68,
+// AD0 high = 0x69, and the clone boards don't always strap it the same way.
+uint8_t imuAddr = 0;
 
 void writeReg(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(IMU_ADDR);
+  Wire.beginTransmission(imuAddr);
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
 }
 
 uint8_t readReg(uint8_t reg) {
-  Wire.beginTransmission(IMU_ADDR);
+  Wire.beginTransmission(imuAddr);
   Wire.write(reg);
   Wire.endTransmission(false);
 
-  if (Wire.requestFrom((uint8_t)IMU_ADDR, (uint8_t)1) != 1)
+  if (Wire.requestFrom((uint8_t)imuAddr, (uint8_t)1) != 1)
     return 0xFF;
 
   return Wire.read();
+}
+
+// Reads WHO_AM_I (0x75) from a specific address without touching imuAddr,
+// so the scan can identify a candidate before committing to it.
+uint8_t probeWhoAmI(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x75);
+  if (Wire.endTransmission(false) != 0)
+    return 0xFF;
+
+  if (Wire.requestFrom(addr, (uint8_t)1) != 1)
+    return 0xFF;
+
+  return Wire.read();
+}
+
+const char *imuName(uint8_t id) {
+  switch (id) {
+    case 0x68: return "MPU6050";
+    case 0x70: return "MPU6500";
+    case 0x71: return "MPU9250";
+    case 0x73: return "MPU9255";
+    case 0x74: return "MPU6555";
+    case 0x75: return "MPU6515";
+    case 0x98: return "MPU6050 clone";
+    default:   return NULL;
+  }
+}
+
+// Walks the whole 7-bit address range, prints everything that ACKs, and
+// returns the first address whose WHO_AM_I looks like an MPU. Scanning the
+// full bus (rather than just 0x68/0x69) also shows up any other device that
+// might be contending for the bus.
+uint8_t findImu() {
+  uint8_t found = 0;
+
+  Serial.println("Scanning I2C bus...");
+
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() != 0)
+      continue;
+
+    Serial.print("  device at 0x");
+    Serial.print(addr, HEX);
+
+    // Wake it before asking who it is -- a sleeping MPU still ACKs its
+    // address but this keeps behaviour consistent with the init below.
+    Wire.beginTransmission(addr);
+    Wire.write(0x6B);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    delay(10);
+
+    uint8_t id = probeWhoAmI(addr);
+    const char *name = imuName(id);
+
+    if (name) {
+      Serial.print("  WHO_AM_I=0x");
+      Serial.print(id, HEX);
+      Serial.print(" -> ");
+      Serial.print(name);
+      if (!found) {
+        found = addr;
+        Serial.print("  [using this one]");
+      }
+    }
+
+    Serial.println();
+  }
+
+  return found;
 }
 
 void setup() {
@@ -29,6 +104,16 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
 
+  imuAddr = findImu();
+
+  if (imuAddr == 0) {
+    Serial.println("No IMU found on the bus!");
+    while (1);
+  }
+
+  Serial.print("Using IMU at 0x");
+  Serial.println(imuAddr, HEX);
+
   // Wake IMU
   writeReg(0x6B, 0x00);
   delay(100);
@@ -36,16 +121,10 @@ void setup() {
   uint8_t id = readReg(0x75);
 
   Serial.print("WHO_AM_I = 0x");
-  Serial.println(id, HEX);
-
-  if (id == 0x68)
-    Serial.println("Detected MPU6050");
-  else if (id == 0x70)
-    Serial.println("Detected MPU6500");
-  else {
-    Serial.println("Unknown IMU!");
-    while (1);
-  }
+  Serial.print(id, HEX);
+  Serial.print("  (");
+  Serial.print(imuName(id));
+  Serial.println(")");
 
   // Gyro ±250 dps
   writeReg(0x1B, 0x00);
@@ -61,11 +140,11 @@ void setup() {
 
 void loop() {
 
-  Wire.beginTransmission(IMU_ADDR);
+  Wire.beginTransmission(imuAddr);
   Wire.write(0x3B);
   Wire.endTransmission(false);
 
-  if (Wire.requestFrom((uint8_t)IMU_ADDR, (uint8_t)14) != 14) {
+  if (Wire.requestFrom((uint8_t)imuAddr, (uint8_t)14) != 14) {
     Serial.println("Read Failed");
     delay(500);
     return;
