@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <string.h>
 
 #define SDA_PIN 1
 #define SCL_PIN 0
@@ -39,6 +40,8 @@ uint8_t probeWhoAmI(uint8_t addr) {
   return Wire.read();
 }
 
+// Never returns NULL -- Serial.print() on a null char* dereferences it and
+// panics, which on native-USB parts turns into a silent reset loop.
 const char *imuName(uint8_t id) {
   switch (id) {
     case 0x68: return "MPU6050";
@@ -48,8 +51,12 @@ const char *imuName(uint8_t id) {
     case 0x74: return "MPU6555";
     case 0x75: return "MPU6515";
     case 0x98: return "MPU6050 clone";
-    default:   return NULL;
+    default:   return "unknown";
   }
+}
+
+bool isKnownImu(uint8_t id) {
+  return id != 0xFF && id != 0x00 && strcmp(imuName(id), "unknown") != 0;
 }
 
 // Walks the whole 7-bit address range, prints everything that ACKs, and
@@ -78,17 +85,15 @@ uint8_t findImu() {
     delay(10);
 
     uint8_t id = probeWhoAmI(addr);
-    const char *name = imuName(id);
 
-    if (name) {
-      Serial.print("  WHO_AM_I=0x");
-      Serial.print(id, HEX);
-      Serial.print(" -> ");
-      Serial.print(name);
-      if (!found) {
-        found = addr;
-        Serial.print("  [using this one]");
-      }
+    Serial.print("  WHO_AM_I=0x");
+    Serial.print(id, HEX);
+    Serial.print(" -> ");
+    Serial.print(imuName(id));
+
+    if (isKnownImu(id) && !found) {
+      found = addr;
+      Serial.print("  [using this one]");
     }
 
     Serial.println();
@@ -97,19 +102,33 @@ uint8_t findImu() {
   return found;
 }
 
+// A bare `while (1);` starves the task watchdog, which panics and resets --
+// on a native-USB part that becomes an invisible boot loop. Idle politely
+// instead, and keep repeating why we stopped so it's visible whenever the
+// serial monitor happens to connect.
+void halt(const char *why) {
+  while (1) {
+    Serial.print("HALTED: ");
+    Serial.println(why);
+    delay(1000);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(2000); // give native USB CDC time to enumerate before the first print
+
+  Serial.println();
+  Serial.println("=== MPU test booting ===");
+  Serial.flush();
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
 
   imuAddr = findImu();
 
-  if (imuAddr == 0) {
-    Serial.println("No IMU found on the bus!");
-    while (1);
-  }
+  if (imuAddr == 0)
+    halt("no IMU found on the bus");
 
   Serial.print("Using IMU at 0x");
   Serial.println(imuAddr, HEX);
@@ -123,7 +142,7 @@ void setup() {
   Serial.print("WHO_AM_I = 0x");
   Serial.print(id, HEX);
   Serial.print("  (");
-  Serial.print(imuName(id));
+  Serial.print(imuName(id)); // safe: never NULL
   Serial.println(")");
 
   // Gyro ±250 dps
