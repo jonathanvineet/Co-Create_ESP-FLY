@@ -36,12 +36,24 @@
 // imu_test sketch, chosen specifically so the existing motor wiring
 // (FL=6, FR=7, BL=20, BR=10) did not need to be redone.
 //
+// NOTE: the standalone imu_test sketch has SDA/SCL the other way round
+// (SDA=1, SCL=0) from what was originally hardcoded here, and that is the
+// combination that actually works on the bench. Rather than pick one, the
+// startup probe below tries both orders and both addresses and keeps
+// whichever one ACKs -- so the same binary works on either wiring.
+//
 // NOTE: GPIO20 is the default UART0 RXD pin on most ESP32-C3 dev boards
 // (used by the USB-serial bridge for flashing/Serial monitor). Driving a
 // motor on GPIO20 can interfere with flashing/serial log while a motor is
 // PWMing on it. Keep this in mind if you lose the ability to reflash.
-#define PIN_SDA        0
-#define PIN_SCL        1
+// These now match the standalone imu_test sketch, which is the combination
+// confirmed working on the bench. Order matters beyond correctness: the
+// startup probe tries this pair FIRST, so on a good board it succeeds on
+// the very first attempt and never has to Wire.end()/re-begin() -- tearing
+// the bus down and back up does not always cleanly release GPIO0/GPIO1 on
+// this core, which can leave the bus in a worse state than it started.
+#define PIN_SDA        1
+#define PIN_SCL        0
 #define PIN_MOTOR_FL   6    // front-left
 #define PIN_MOTOR_FR   7    // front-right
 #define PIN_MOTOR_BL   20   // back-left
@@ -77,27 +89,67 @@ const unsigned long FAILSAFE_TIMEOUT_MS = 300;
 bool armed = false;
 int imuFailStreak = 0;
 const int IMU_FAIL_DISARM_THRESHOLD = 25; // ~100ms of consecutive failures at 250Hz
+const int IMU_REINIT_INTERVAL = 250;      // retry bus recovery ~1s apart at 250Hz
 
-// ---------- MPU6050 ----------
-#define MPU_ADDR 0x68
+// ---------- IMU: MPU6050 and MPU6500/6555/9250-family clones ----------
+// The "MPU6050" modules being used are a mix of genuine MPU6050s and clone
+// boards that actually report as an MPU6500/6555. Both are register
+// compatible for everything this flight controller touches (power
+// management, sample rate, DLPF, gyro/accel full-scale, and the 14-byte
+// burst starting at ACCEL_XOUT_H), so the only thing that has to adapt is
+// the identification and the temperature conversion -- and temperature is
+// unused here. So: probe, accept the whole family, otherwise identical.
 #define REG_PWR_MGMT_1   0x6B
 #define REG_SMPLRT_DIV   0x19
 #define REG_CONFIG       0x1A
 #define REG_GYRO_CONFIG  0x1B
 #define REG_ACCEL_CONFIG 0x1C
 #define REG_ACCEL_XOUT_H 0x3B
+#define REG_WHO_AM_I     0x75
 
 const float ACCEL_SCALE = 16384.0f; // LSB/g at +-2g
 const float GYRO_SCALE  = 131.0f;   // LSB/(deg/s) at +-250deg/s
 
+// Resolved at boot by imuProbe(). AD0 low = 0x68, AD0 high = 0x69.
+uint8_t mpuAddr = 0x68;
+uint8_t mpuWhoAmI = 0x00;
+int imuSdaPin = PIN_SDA;
+int imuSclPin = PIN_SCL;
+bool imuPresent = false;
+
 float pitchAngle = 0.0f, rollAngle = 0.0f;
 float gyroXoff = 0, gyroYoff = 0, gyroZoff = 0;
 
+// WHO_AM_I values seen across the genuine part and the clones that ship on
+// "MPU6050" breakout boards. All are register compatible for our usage.
+const char *imuNameFor(uint8_t id) {
+  switch (id) {
+    case 0x68: return "MPU6050";
+    case 0x69: return "MPU6050 (alt id)";
+    case 0x70: return "MPU6500";
+    case 0x71: return "MPU9250";
+    case 0x73: return "MPU9255";
+    case 0x74: return "MPU6555";
+    case 0x75: return "MPU6515";
+    case 0x98: return "MPU6050 clone";
+    default:   return NULL;
+  }
+}
+
 void mpuWriteReg(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MPU_ADDR);
+  Wire.beginTransmission(mpuAddr);
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
+}
+
+// Returns 0xFF on a failed read (0xFF is not a valid WHO_AM_I for this family).
+uint8_t mpuReadReg(uint8_t reg) {
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return 0xFF;
+  if (Wire.requestFrom((uint8_t)mpuAddr, (uint8_t)1) != 1) return 0xFF;
+  return Wire.read();
 }
 
 void mpuInit() {
@@ -109,17 +161,91 @@ void mpuInit() {
   mpuWriteReg(REG_ACCEL_CONFIG, 0x00); // +-2g
 }
 
+// Try one (SDA, SCL, address) combination: bring the bus up, wake the part,
+// and see whether WHO_AM_I comes back as something we recognise.
+bool imuTryBus(int sda, int scl, uint8_t addr) {
+  Wire.end();
+  Wire.begin(sda, scl);
+  Wire.setClock(100000); // lower clock for noise immunity against motor PWM
+  delay(10);
+
+  mpuAddr = addr;
+  mpuWriteReg(REG_PWR_MGMT_1, 0x00); // wake before reading WHO_AM_I
+  delay(100);
+
+  uint8_t id = mpuReadReg(REG_WHO_AM_I);
+  if (imuNameFor(id) == NULL) return false;
+
+  imuSdaPin = sda;
+  imuSclPin = scl;
+  mpuWhoAmI = id;
+  return true;
+}
+
+// Probe both pin orders and both addresses. The wiring on these boards has
+// been ambiguous (see the pin notes above) and the clones sometimes sit on
+// 0x69, so trying all four combinations is cheap insurance at boot.
+bool imuProbe() {
+  const int pinOrders[2][2] = {{PIN_SDA, PIN_SCL}, {PIN_SCL, PIN_SDA}};
+  const uint8_t addrs[2] = {0x68, 0x69};
+
+  for (int p = 0; p < 2; p++) {
+    for (int a = 0; a < 2; a++) {
+      if (imuTryBus(pinOrders[p][0], pinOrders[p][1], addrs[a])) {
+        Serial.print("IMU found: ");
+        Serial.print(imuNameFor(mpuWhoAmI));
+        Serial.print(" (WHO_AM_I=0x");
+        Serial.print(mpuWhoAmI, HEX);
+        Serial.print(") addr=0x");
+        Serial.print(mpuAddr, HEX);
+        Serial.print(" SDA=");
+        Serial.print(imuSdaPin);
+        Serial.print(" SCL=");
+        Serial.println(imuSclPin);
+        return true;
+      }
+    }
+  }
+
+  Serial.println("IMU NOT FOUND on either pin order / address. "
+                  "Arming will be refused.");
+  return false;
+}
+
+// Bus recovery: re-run the full init on the already-known good pins/address.
+// Used when the IMU stops responding mid-flight-loop (motor PWM noise can
+// wedge the bus), so the link can come back without a power cycle.
+void imuReinit() {
+  Wire.end();
+  Wire.begin(imuSdaPin, imuSclPin);
+  Wire.setClock(100000);
+  delay(10);
+  mpuInit();
+}
+
 // Motor PWM switching noise on the I2C bus can corrupt an occasional
 // transaction. Retry a few times before giving up -- a clean retry is much
 // cheaper than a false disarm.
 const int MPU_READ_RETRIES = 3;
 
+// Last failure detail, surfaced in the [DBG] line so a failing bus can be
+// diagnosed from the serial monitor instead of guessed at.
+//   lastTxErr: return of endTransmission() -- 0 ok, 1 data too long,
+//              2 NACK on address, 3 NACK on data, 4 other, 5 timeout.
+//              2 = nothing is answering at that address (wiring/pullups).
+//              5 = bus wedged, slave holding SDA (noise / interrupted xfer).
+//   lastRxCount: bytes actually returned by requestFrom() (want 14).
+uint8_t lastTxErr = 0;
+int lastRxCount = 0;
+
 bool mpuReadRawOnce(int16_t &ax, int16_t &ay, int16_t &az,
                      int16_t &gx, int16_t &gy, int16_t &gz) {
-  Wire.beginTransmission(MPU_ADDR);
+  Wire.beginTransmission(mpuAddr);
   Wire.write(REG_ACCEL_XOUT_H);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((int)MPU_ADDR, 14) != 14) return false;
+  lastTxErr = Wire.endTransmission(false);
+  if (lastTxErr != 0) return false;
+  lastRxCount = Wire.requestFrom((uint8_t)mpuAddr, (uint8_t)14);
+  if (lastRxCount != 14) return false;
 
   ax = (Wire.read() << 8) | Wire.read();
   ay = (Wire.read() << 8) | Wire.read();
@@ -299,6 +425,18 @@ void handleSerialCommands() {
 }
 
 // ---------- Setup ----------
+// Bisect switch. The standalone imu_test sketch reads this same IMU
+// flawlessly, and the two big differences here are (a) WiFi AP + web server
+// running on this single-core chip and (b) a 250Hz read rate instead of 4Hz.
+// Set this to 1 to bring the radio up as normal; set it to 0 to build a
+// no-radio version that is otherwise identical to the flight firmware.
+//
+// If the IMU loop is solid with this at 0 and fails at 1, the fault is
+// WiFi/loop-timing contention on the I2C bus, not the IMU or the wiring.
+// Flight control is unusable with the radio off (no link => never arms),
+// so this is a bench diagnostic only -- leave it at 1 to fly.
+#define ENABLE_WIFI 1
+
 unsigned long lastLoopMicros = 0;
 const unsigned long LOOP_PERIOD_US = 4000; // 250Hz control loop
 
@@ -310,13 +448,21 @@ void setup() {
   motorsInit();
   motorsStop();
 
-  Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000); // lower clock for noise immunity against motor PWM switching
-  mpuInit();
-  Serial.println("Calibrating gyro, keep the frame still...");
-  mpuCalibrateGyro();
-  Serial.println("Gyro calibration done.");
+  // Probe leaves the bus configured on whichever pins/address answered.
+  imuPresent = imuProbe();
+  if (imuPresent) {
+    mpuInit();
+    Serial.println("Calibrating gyro, keep the frame still...");
+    mpuCalibrateGyro();
+    Serial.println("Gyro calibration done.");
+  } else {
+    // Keep booting so the WiFi/web UI and the serial motor test mode are
+    // still reachable for debugging -- but arming stays blocked below.
+    Serial.println("Skipping gyro calibration (no IMU). "
+                    "Serial motor test mode still available.");
+  }
 
+#if ENABLE_WIFI
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   udp.begin(UDP_PORT);
@@ -328,7 +474,12 @@ void setup() {
   webServer.on("/", handleWebRoot);
   webServer.on("/control", handleWebControl);
   webServer.begin();
+#else
+  WiFi.mode(WIFI_OFF);
+  Serial.println("*** ENABLE_WIFI=0: radio OFF, IMU-diagnostic build. ***");
+  Serial.println("*** No control link -- will never arm. Bench use only. ***");
   Serial.println("Web control UI: http://192.168.4.1/");
+#endif
 
   lastLoopMicros = micros();
   lastPacketMillis = millis();
@@ -529,8 +680,10 @@ void handleWebControl() {
 
 // ---------- Main loop ----------
 void loop() {
+#if ENABLE_WIFI
   pollUdp();
   webServer.handleClient();
+#endif
   handleSerialCommands();
 
   unsigned long nowUs = micros();
@@ -558,7 +711,7 @@ void loop() {
   // exact 0->1 transition instant, which is prone to missing the window
   // if throttle has already ramped up by the time packets start arriving,
   // e.g. right after boot). Still can't arm at high throttle.
-  bool armedFlag = linkOk && (pkt.armed != 0);
+  bool armedFlag = linkOk && imuPresent && (pkt.armed != 0);
   if (armedFlag && !armed && pkt.throttle < 50) {
     armed = true;
     pitchPID.reset();
@@ -584,7 +737,9 @@ void loop() {
     Serial.print(" pkt.armed=");   Serial.print(pkt.armed);
     Serial.print(" throttle=");    Serial.print(pkt.throttle);
     Serial.print(" msSinceLastPkt="); Serial.print(millis() - lastPacketMillis);
-    Serial.print(" imuFailStreak=");  Serial.println(imuFailStreak);
+    Serial.print(" imuFailStreak=");  Serial.print(imuFailStreak);
+    Serial.print(" txErr=");          Serial.print(lastTxErr);
+    Serial.print(" rxCount=");        Serial.println(lastRxCount);
   }
 
   // --- IMU update ---
@@ -639,6 +794,13 @@ void loop() {
     imuFailStreak++;
     if (imuFailStreak >= IMU_FAIL_DISARM_THRESHOLD) {
       armed = false;
+      // Sustained loss: the bus itself is likely wedged (motor PWM noise can
+      // leave a slave mid-transaction holding SDA). Re-init periodically so
+      // it can recover without a power cycle, rather than failing forever.
+      if (imuFailStreak % IMU_REINIT_INTERVAL == 0) {
+        Serial.println("[IMU] sustained read failure, re-initialising bus...");
+        imuReinit();
+      }
     }
     motorsStop(); // always safe to skip motor output for this one cycle
   }
